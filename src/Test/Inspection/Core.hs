@@ -307,6 +307,11 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
         , let k1 = typeKind t1
         , isConstraintKind k1
         = withConstraintLetL v1 b1 $ go e1 e2
+
+        | Just (Var f, _) <- unApp b1
+        , isClassOpId f
+        = withConstraintLetL v1 b1 $ go e1 e2
+
 --        = inequality $ hsep [ text "LET", text "?", ppr v1, text "=", ppr b1, text ":", ppr t1, text ":", ppr k1 ]
 
     go' e1 (Let (NonRec v2 b2) e2)
@@ -314,7 +319,11 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
         , let k2 = typeKind t2
         , isConstraintKind k2
         = withConstraintLetR v2 b2 $ go e1 e2
---        = inequality $ hsep [ text "LET", text "?", ppr v2, text "=", ppr b2, text ":", ppr t2, text ":", ppr k2 ]
+
+        | Just (Var f, _) <- unApp b2
+        , isClassOpId f
+        = withConstraintLetR v2 b2 $ go e1 e2
+        -- inequality $ hsep [ text "LET", ppr b2 ]
 
     go' (essentiallyVar -> Just v1) (essentiallyVar -> Just v2) = do
         env <- askRnEnv
@@ -476,6 +485,18 @@ isUnsafeEqualityCase scrut _bndr [Alt _ _ rhs]
   | isUnsafeEqualityProof scrut = Just rhs
 isUnsafeEqualityCase _ _ _ = Nothing
 #endif
+
+unApp :: CoreExpr -> Maybe (CoreExpr, CoreExpr)
+unApp (Cast f _) = unApp f
+unApp (App f t)
+    | isTypeArg t = unApp f
+    | otherwise   = Just (unCast f, t)
+unApp _ = Nothing
+
+unCast :: CoreExpr -> CoreExpr
+unCast (App f t) | isTypeArg t = unCast f
+unCast (Cast e _) = unCast e
+unCast e          = e
 
 #if !MIN_VERSION_ghc(9,2,0)
 type CoreTickish = Tickish Id
