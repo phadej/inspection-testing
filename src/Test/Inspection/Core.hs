@@ -218,7 +218,7 @@ bindEqEnv ls rs (EqEnv i env1 env2)= EqEnv (i + 1)
 
 -- |report inequality
 inequality ::  SDoc -> EqM a
-inequality err = EqM $ \(# ctx, _, _, _, _#) -> Left $ case ctx of
+inequality err = EqM $ \(# ctx, _, _, _, _, _ #) -> Left $ case ctx of
     [] -> err
     _  -> err $$ hang (text "in") 2 (vcat ctx)
 
@@ -270,7 +270,7 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
            -> do
               let env = rnBndr2 (mkRnEnv2 emptyInScopeSet) x y
                   ee  = initialEqEnv slice1 slice2
-              unEqM (go e1 e2) (# [], 0, env, ee, emptyVarEnv #)
+              unEqM (go e1 e2) (# [], 0, env, ee, emptyVarEnv, emptyVarEnv #)
 
     essentiallyVar :: CoreExpr -> Maybe Var
     essentiallyVar (App e a)  | it, isTyCoArg a = essentiallyVar e
@@ -329,6 +329,20 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
            | otherwise -> do
             tracePut "VAR" (varToString v1 ++ " =?= " ++ varToString v2 ++ " NOT EQUAL")
             inequality $ hsep [ text "inequal variables", ppr v1, text "and", ppr v2 ]
+
+    go (Let (NonRec v1 b1) e1) e2
+        | let t1 = exprType b1
+        , let k1 = typeKind t1
+        , isConstraintKind k1
+        = do
+             inequality $ hsep [ text "LET", text "?", ppr v1, text "=", ppr b1, text ":", ppr t1, text ":", ppr k1 ]
+
+    go e1 (Let (NonRec v2 b2) e2)
+        | let t2 = exprType b2
+        , let k2 = typeKind t2
+        , isConstraintKind k2
+        = do
+             inequality $ hsep [ text "LET", text "?", ppr v2, text "=", ppr b2, text ":", ppr t2, text ":", ppr k2 ]
 
     go (Lit lit1)    (Lit lit2)        = do
         tracePut "LIT" "???" -- no Show for Literal :(
@@ -451,27 +465,27 @@ type CoreTickish = Tickish Id
 #endif
 
 -- | Monad for eqSlice
-newtype EqM a = EqM_ { unEqM :: (# [SDoc], Int, RnEnv2, EqEnv, VarEnv CoreExpr #) -> Either SDoc a }
+newtype EqM a = EqM_ { unEqM :: (# [SDoc], Int, RnEnv2, EqEnv, VarEnv CoreExpr, VarEnv CoreExpr #) -> Either SDoc a }
   deriving Functor
 
-pattern EqM :: ((# [SDoc], Int, RnEnv2, EqEnv, VarEnv CoreExpr #) -> Either SDoc a) -> EqM a
+pattern EqM :: ((# [SDoc], Int, RnEnv2, EqEnv, VarEnv CoreExpr, VarEnv CoreExpr #) -> Either SDoc a) -> EqM a
 pattern EqM m <- (unEqM -> m)
   where EqM m = EqM_ (oneShot m)
 
-localEqM :: ((# [SDoc], Int, RnEnv2, EqEnv, VarEnv CoreExpr #) -> (# [SDoc], Int, RnEnv2, EqEnv, VarEnv CoreExpr #)) -> EqM a -> EqM a
+localEqM :: ((# [SDoc], Int, RnEnv2, EqEnv, VarEnv CoreExpr, VarEnv CoreExpr #) -> (# [SDoc], Int, RnEnv2, EqEnv, VarEnv CoreExpr, VarEnv CoreExpr #)) -> EqM a -> EqM a
 localEqM f m = EqM $ \r -> unEqM m (f r)
 
 askRnEnv :: EqM RnEnv2
-askRnEnv = EqM $ \(# _, _, env, _, _ #) -> pure env
+askRnEnv = EqM $ \(# _, _, env, _, _, _ #) -> pure env
 
 askEqEnv :: EqM EqEnv
-askEqEnv = EqM $ \(# _, _, _, ee, _ #) -> pure ee
+askEqEnv = EqM $ \(# _, _, _, ee, _, _ #) -> pure ee
 
 pushCtx :: SDoc -> EqM a -> EqM a
-pushCtx d m = EqM $ \(# ctx, lv, env, ee, lets #) -> unEqM m (# d : ctx, lv, env, ee, lets #)
+pushCtx d m = EqM $ \(# ctx, lv, env, ee, letsL, letsR #) -> unEqM m (# d : ctx, lv, env, ee, letsL, letsR #)
 
 localRnEnv :: (RnEnv2 -> RnEnv2) -> EqM a -> EqM a
-localRnEnv f m = EqM $ \(# ctx, lv, env, ee, lets #) -> unEqM m (# ctx, lv, f env, ee, lets #)
+localRnEnv f m = EqM $ \(# ctx, lv, env, ee, letsL, letsR #) -> unEqM m (# ctx, lv, f env, ee, letsL, letsR #)
 
 withEqualVar :: Var -> Var -> EqM a -> EqM a
 withEqualVar v1 v2 = localRnEnv (\env' -> rnBndr2 env' v1 v2)
@@ -480,7 +494,7 @@ withEqualVars :: [Var] -> [Var] -> EqM a -> EqM a
 withEqualVars vs1 vs2 = localRnEnv (\env' -> rnBndrs2 env' vs1 vs2)
 
 localEqEnv :: (EqEnv -> EqEnv) -> EqM a -> EqM a
-localEqEnv f m = EqM $ \(# ctx, lv, env, ee, lets #) -> unEqM m (# ctx, lv, env, f ee, lets #)
+localEqEnv f m = EqM $ \(# ctx, lv, env, ee, letsL, letsR #) -> unEqM m (# ctx, lv, env, f ee, letsL, letsR #)
 
 instance Applicative EqM where
   pure x = EqM (\_ -> pure x)
@@ -493,12 +507,12 @@ instance Monad EqM where
     unEqM (k x) r
 
 tracePut :: String -> String -> EqM ()
-tracePut tag msg = EqM $ \ (# _, lv, _, _, _ #) -> tracePut' lv tag msg
+tracePut tag msg = EqM $ \ (# _, lv, _, _, _, _ #) -> tracePut' lv tag msg
 
 traceBlock :: String -> String -> EqM () -> EqM ()
 traceBlock name msg action = do
     tracePut name msg
-    localEqM (\(# ctx, lv, env, ee, lets #) -> (# ctx, lv + 1, env, ee, lets #)) action
+    localEqM (\(# ctx, lv, env, ee, letsL, letsR #) -> (# ctx, lv + 1, env, ee, letsL, letsR #)) action
     tracePut name $ msg ++ " OK"
 
 showVars :: [(Var, a)] -> String
