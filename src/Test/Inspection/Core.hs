@@ -93,6 +93,10 @@ pattern Alt a b c = (a, b, c)
 {-# COMPLETE Alt #-}
 #endif
 
+#if !MIN_VERSION_ghc(9,6,0)
+isConstraintKind :: Kind -> Bool
+isConstraintKind = tcIsConstraintKind
+#endif
 
 type Slice = [(Var, CoreExpr)]
 
@@ -310,7 +314,8 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
 
         | Just (Var f, _) <- unApp b1
         , isClassOpId f
-        = withConstraintLetL v1 b1 $ go e1 e2
+        = inequality $ hsep [ text "LET", ppr (idUnfolding f) ]
+        -- = withConstraintLetL v1 b1 $ go e1 e2
 
 --        = inequality $ hsep [ text "LET", text "?", ppr v1, text "=", ppr b1, text ":", ppr t1, text ":", ppr k1 ]
 
