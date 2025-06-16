@@ -285,7 +285,38 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
     essentiallyVar _                            = Nothing
 
     go :: CoreExpr -> CoreExpr -> EqM ()
-    go (essentiallyVar -> Just v1) (essentiallyVar -> Just v2) = do
+    go e1@(essentiallyVar -> Just v1) e2 = EqM $ \ r@(# _, _, _, _, letsL, letsR #) ->
+        case lookupVarEnv letsL v1 of
+            Just b1 -> unEqM (go b1 e2) r
+            Nothing -> case essentiallyVar e2 of
+                Nothing -> unEqM (go' e1 e2) r
+                Just v2 -> case lookupVarEnv letsR v2 of
+                    Nothing -> unEqM (go' e1 e2) r
+                    Just b2 -> unEqM (go e1 b2) r
+
+    go e1 e2@((essentiallyVar -> Just v2)) = EqM $ \ r@(# _, _, _, _, _, letsR #) ->
+        case lookupVarEnv letsR v2 of
+            Just b2 -> unEqM (go e1 b2) r
+            Nothing -> unEqM (go' e1 e2) r
+
+    go e1 e2 = go' e1 e2
+
+    go' :: CoreExpr -> CoreExpr -> EqM ()
+    go' (Let (NonRec v1 b1) e1) e2
+        | let t1 = exprType b1
+        , let k1 = typeKind t1
+        , isConstraintKind k1
+        = withConstraintLetL v1 b1 $ go e1 e2
+--        = inequality $ hsep [ text "LET", text "?", ppr v1, text "=", ppr b1, text ":", ppr t1, text ":", ppr k1 ]
+
+    go' e1 (Let (NonRec v2 b2) e2)
+        | let t2 = exprType b2
+        , let k2 = typeKind t2
+        , isConstraintKind k2
+        = withConstraintLetR v2 b2 $ go e1 e2
+--        = inequality $ hsep [ text "LET", text "?", ppr v2, text "=", ppr b2, text ":", ppr t2, text ":", ppr k2 ]
+
+    go' (essentiallyVar -> Just v1) (essentiallyVar -> Just v2) = do
         env <- askRnEnv
         ee  <- askEqEnv
         -- NOTE: The ordering of this checks is important.
@@ -330,61 +361,47 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
             tracePut "VAR" (varToString v1 ++ " =?= " ++ varToString v2 ++ " NOT EQUAL")
             inequality $ hsep [ text "inequal variables", ppr v1, text "and", ppr v2 ]
 
-    go (Let (NonRec v1 b1) e1) e2
-        | let t1 = exprType b1
-        , let k1 = typeKind t1
-        , isConstraintKind k1
-        = do
-             inequality $ hsep [ text "LET", text "?", ppr v1, text "=", ppr b1, text ":", ppr t1, text ":", ppr k1 ]
-
-    go e1 (Let (NonRec v2 b2) e2)
-        | let t2 = exprType b2
-        , let k2 = typeKind t2
-        , isConstraintKind k2
-        = do
-             inequality $ hsep [ text "LET", text "?", ppr v2, text "=", ppr b2, text ":", ppr t2, text ":", ppr k2 ]
-
-    go (Lit lit1)    (Lit lit2)        = do
+    go' (Lit lit1)    (Lit lit2)        = do
         tracePut "LIT" "???" -- no Show for Literal :(
         unless (lit1 == lit2) $ inequality $ sep [ text "inequal literals", ppr lit1, text "and", ppr lit2 ]
 
-    go (Type t1)     (Type t2)         =
+    go' (Type t1)     (Type t2)         =
         goTypes t1 t2
 
-    go (Coercion co1) (Coercion co2)   =
+    go' (Coercion co1) (Coercion co2)   =
         goCoercions co1 co2
 
-    go (Cast e1 _) e2 | it             = go e1 e2
-    go e1 (Cast e2 _) | it             = go e1 e2
+    go' (Cast e1 _) e2 | it             = go e1 e2
+    go' e1 (Cast e2 _) | it             = go e1 e2
 #if MIN_VERSION_ghc(9,0,0)
-    go (Case s b _ alts) e2 | it, Just e1 <- isUnsafeEqualityCase s b alts = go e1 e2
-    go e1 (Case s b _ alts) | it, Just e2 <- isUnsafeEqualityCase s b alts = go e1 e2
+    go' (Case s b _ alts) e2 | it, Just e1 <- isUnsafeEqualityCase s b alts = go e1 e2
+    go' e1 (Case s b _ alts) | it, Just e2 <- isUnsafeEqualityCase s b alts = go e1 e2
 #endif
-    go (Cast e1 co1) (Cast e2 co2)     = traceBlock "CAST" "" $ do
+    go' (Cast e1 co1) (Cast e2 co2)     = traceBlock "CAST" "" $ do
                                                    goCoercions co1 co2
                                                    go e1 e2
 
-    go (App e1 a) e2 | it, isTyCoArg a = go e1 e2
-    go e1 (App e2 a) | it, isTyCoArg a = go e1 e2
-    go (App f1 a1)   (App f2 a2)       = traceBlock "APP" "" $ do
+    go' (App e1 a) e2 | it, isTyCoArg a = go e1 e2
+    go' e1 (App e2 a) | it, isTyCoArg a = go e1 e2
+    go' (App f1 a1)   (App f2 a2)       = traceBlock "APP" "" $ do
                                                    go f1 f2
                                                    go a1 a2
-    go (Tick HpcTick{} e1) e2 | it     = go e1 e2
-    go e1 (Tick HpcTick{} e2) | it     = go e1 e2
-    go (Tick SourceNote{} e1) e2       = go e1 e2
-    go e1 (Tick SourceNote{} e2)       = go e1 e2
-    go (Tick n1 e1)  (Tick n2 e2)      = traceBlock "TICK" "" $ do
+    go' (Tick HpcTick{} e1) e2 | it     = go e1 e2
+    go' e1 (Tick HpcTick{} e2) | it     = go e1 e2
+    go' (Tick SourceNote{} e1) e2       = go e1 e2
+    go' e1 (Tick SourceNote{} e2)       = go e1 e2
+    go' (Tick n1 e1)  (Tick n2 e2)      = traceBlock "TICK" "" $ do
                                                    env <- askRnEnv
                                                    unless (go_tick env n1 n2) $ inequality $ text "inequal ticks"
                                                    go e1 e2
 
-    go (Lam b e1) e2 | it, isTyCoVar b = go e1 e2
-    go e1 (Lam b e2) | it, isTyCoVar b = go e1 e2
-    go (Lam b1 e1)  (Lam b2 e2)        = traceBlock "LAM" (varToString b1 ++ " ~ " ++ varToString b2) $ do
+    go' (Lam b e1) e2 | it, isTyCoVar b = go e1 e2
+    go' e1 (Lam b e2) | it, isTyCoVar b = go e1 e2
+    go' (Lam b1 e1)  (Lam b2 e2)        = traceBlock "LAM" (varToString b1 ++ " ~ " ++ varToString b2) $ do
            unless it $ goTypes (varType b1) (varType b2)
            withEqualVar b1 b2 $ go e1 e2
 
-    go e1@(Let _ _) e2@(Let _ _)
+    go' e1@(Let _ _) e2@(Let _ _)
       | ul
       , (ps1, e1') <- peelLets e1
       , (ps2, e2') <- peelLets e2
@@ -394,11 +411,11 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
            unless (equalLength ps1 ps2) $ inequality $ text "different amount of bindings in let"
            go e1' e2'
 
-    go (Let (NonRec v1 r1) e1) (Let (NonRec v2 r2) e2)
+    go' (Let (NonRec v1 r1) e1) (Let (NonRec v2 r2) e2)
       = do go r1 r2  -- No need to check binder types, since RHSs match
            withEqualVar v1 v2 $ go e1 e2
 
-    go (Let (Rec ps1) e1) (Let (Rec ps2) e2)
+    go' (Let (Rec ps1) e1) (Let (Rec ps2) e2)
       = withEqualVars bs1 bs2 $ do
            unless (equalLength ps1 ps2) $ inequality $ text "different amount of bindings in recursive let"
            sequence_ $ zipWith go rs1 rs2
@@ -410,7 +427,7 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
         (bs1,rs1) = unzip ps1
         (bs2,rs2) = unzip ps2
 
-    go (Case e1 b1 t1 a1) (Case e2 b2 t2 a2)
+    go' (Case e1 b1 t1 a1) (Case e2 b2 t2 a2)
       | null a1   -- See Note [Empty case alternatives] in TrieMap
       , null a2
       = do
@@ -423,7 +440,7 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
            go e1 e2
            withEqualVar b1 b2 $ sequence_ $ zipWith go_alt a1 a2
 
-    go e1 e2 = do
+    go' e1 e2 = do
         tracePut "FAIL" (conToString e1 ++ " =/= " ++ conToString e2)
         inequality $ sep [ text "inequal terms:", ppr e1, text "and", ppr e2]
 
@@ -495,6 +512,12 @@ withEqualVars vs1 vs2 = localRnEnv (\env' -> rnBndrs2 env' vs1 vs2)
 
 localEqEnv :: (EqEnv -> EqEnv) -> EqM a -> EqM a
 localEqEnv f m = EqM $ \(# ctx, lv, env, ee, letsL, letsR #) -> unEqM m (# ctx, lv, env, f ee, letsL, letsR #)
+
+withConstraintLetL :: Var -> Expr CoreBndr -> EqM () -> EqM ()
+withConstraintLetL v e m = EqM $ \(# ctx, lv, env, ee, letsL, letsR #) -> unEqM m (# ctx, lv, env, ee, extendVarEnv letsL v e, letsR #)
+
+withConstraintLetR :: Var -> Expr CoreBndr -> EqM () -> EqM ()
+withConstraintLetR v e m = EqM $ \(# ctx, lv, env, ee, letsL, letsR #) -> unEqM m (# ctx, lv, env, ee, letsL, extendVarEnv letsR v e #)
 
 instance Applicative EqM where
   pure x = EqM (\_ -> pure x)
