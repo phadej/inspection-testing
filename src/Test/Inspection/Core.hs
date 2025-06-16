@@ -316,7 +316,7 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
              then do
                tracePut "VAR" (varToString v1 ++ " =?= " ++ varToString v2 ++ " BOUND " ++ show i)
                pushCtx (text "comparing definitions of" <+> ppr v1 <+> text "=?=" <+> ppr v2) $
-                  localRnEnv (\env' -> rnBndr2 env' v1 v2) $
+                  withEqualVar v1 v2 $
                   go e1 e2
              else do
                tracePut "VAR" (varToString v1 ++ " =?= " ++ varToString v2 ++ " BOUND IN DIFFERENT LETS " ++ show i ++ " /= " ++ show j)
@@ -368,7 +368,7 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
     go e1 (Lam b e2) | it, isTyCoVar b = go e1 e2
     go (Lam b1 e1)  (Lam b2 e2)        = traceBlock "LAM" (varToString b1 ++ " ~ " ++ varToString b2) $ do
            unless it $ goTypes (varType b1) (varType b2)
-           localRnEnv (\env -> rnBndr2 env b1 b2) $ go e1 e2
+           withEqualVar b1 b2 $ go e1 e2
 
     go e1@(Let _ _) e2@(Let _ _)
       | ul
@@ -382,10 +382,10 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
 
     go (Let (NonRec v1 r1) e1) (Let (NonRec v2 r2) e2)
       = do go r1 r2  -- No need to check binder types, since RHSs match
-           localRnEnv (\env -> rnBndr2 env v1 v2) $ go e1 e2
+           withEqualVar v1 v2 $ go e1 e2
 
     go (Let (Rec ps1) e1) (Let (Rec ps2) e2)
-      = localRnEnv (\env' -> rnBndrs2 env' bs1 bs2) $ do
+      = withEqualVars bs1 bs2 $ do
            unless (equalLength ps1 ps2) $ inequality $ text "different amount of bindings in recursive let"
            sequence_ $ zipWith go rs1 rs2
            go e1 e2
@@ -407,8 +407,7 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
       = traceBlock "CASE" "..." $ do
            unless (equalLength a1 a2) $ inequality $ text "different amount of alternatives in case"
            go e1 e2
-           localRnEnv (\env -> rnBndr2 env b1 b2) $ do
-             sequence_ $ zipWith go_alt a1 a2
+           withEqualVar b1 b2 $ sequence_ $ zipWith go_alt a1 a2
 
     go e1 e2 = do
         tracePut "FAIL" (conToString e1 ++ " =/= " ++ conToString e2)
@@ -451,7 +450,6 @@ isUnsafeEqualityCase _ _ _ = Nothing
 type CoreTickish = Tickish Id
 #endif
 
-
 -- | Monad for eqSlice
 newtype EqM a = EqM_ { unEqM :: (# [SDoc], Int, RnEnv2, EqEnv #) -> Either SDoc a }
   deriving Functor
@@ -474,6 +472,12 @@ pushCtx d m = EqM $ \(# ctx, lv, env, ee #) -> unEqM m (# d : ctx, lv, env, ee #
 
 localRnEnv :: (RnEnv2 -> RnEnv2) -> EqM a -> EqM a
 localRnEnv f m = EqM $ \(# ctx, lv, env, ee #) -> unEqM m (# ctx, lv, f env, ee #)
+
+withEqualVar :: Var -> Var -> EqM a -> EqM a
+withEqualVar v1 v2 = localRnEnv (\env' -> rnBndr2 env' v1 v2)
+
+withEqualVars :: [Var] -> [Var] -> EqM a -> EqM a
+withEqualVars vs1 vs2 = localRnEnv (\env' -> rnBndrs2 env' vs1 vs2)
 
 localEqEnv :: (EqEnv -> EqEnv) -> EqM a -> EqM a
 localEqEnv f m = EqM $ \(# ctx, lv, env, ee #) -> unEqM m (# ctx, lv, env, f ee #)
@@ -510,7 +514,7 @@ varToString v = occNameString (occName (tyVarName v)) ++ "_" ++ show (getUnique 
 conToString :: CoreExpr -> [Char]
 conToString Var {}      = "Var"
 conToString Lit {}      = "Lit"
-gconToString App {}      = "App"
+conToString App {}      = "App"
 conToString Lam {}      = "Lam"
 conToString Let {}      = "Let"
 conToString Case {}     = "Case"
