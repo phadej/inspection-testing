@@ -218,7 +218,7 @@ bindEqEnv ls rs (EqEnv i env1 env2)= EqEnv (i + 1)
 
 -- |report inequality
 inequality ::  SDoc -> EqM a
-inequality err = EqM $ \(# ctx, _, _, _ #) -> Left $ case ctx of
+inequality err = EqM $ \(# ctx, _, _, _, _#) -> Left $ case ctx of
     [] -> err
     _  -> err $$ hang (text "in") 2 (vcat ctx)
 
@@ -270,7 +270,7 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
            -> do
               let env = rnBndr2 (mkRnEnv2 emptyInScopeSet) x y
                   ee  = initialEqEnv slice1 slice2
-              unEqM (go e1 e2) (# [], 0, env, ee #)
+              unEqM (go e1 e2) (# [], 0, env, ee, emptyVarEnv #)
 
     essentiallyVar :: CoreExpr -> Maybe Var
     essentiallyVar (App e a)  | it, isTyCoArg a = essentiallyVar e
@@ -451,27 +451,27 @@ type CoreTickish = Tickish Id
 #endif
 
 -- | Monad for eqSlice
-newtype EqM a = EqM_ { unEqM :: (# [SDoc], Int, RnEnv2, EqEnv #) -> Either SDoc a }
+newtype EqM a = EqM_ { unEqM :: (# [SDoc], Int, RnEnv2, EqEnv, VarEnv CoreExpr #) -> Either SDoc a }
   deriving Functor
 
-pattern EqM :: ((# [SDoc], Int, RnEnv2, EqEnv #) -> Either SDoc a) -> EqM a
+pattern EqM :: ((# [SDoc], Int, RnEnv2, EqEnv, VarEnv CoreExpr #) -> Either SDoc a) -> EqM a
 pattern EqM m <- (unEqM -> m)
   where EqM m = EqM_ (oneShot m)
 
-localEqM :: ((# [SDoc], Int, RnEnv2, EqEnv #) -> (# [SDoc], Int, RnEnv2, EqEnv #)) -> EqM a -> EqM a
+localEqM :: ((# [SDoc], Int, RnEnv2, EqEnv, VarEnv CoreExpr #) -> (# [SDoc], Int, RnEnv2, EqEnv, VarEnv CoreExpr #)) -> EqM a -> EqM a
 localEqM f m = EqM $ \r -> unEqM m (f r)
 
 askRnEnv :: EqM RnEnv2
-askRnEnv = EqM $ \(# _, _, env, _ #) -> pure env
+askRnEnv = EqM $ \(# _, _, env, _, _ #) -> pure env
 
 askEqEnv :: EqM EqEnv
-askEqEnv = EqM $ \(# _, _, _, ee #) -> pure ee
+askEqEnv = EqM $ \(# _, _, _, ee, _ #) -> pure ee
 
 pushCtx :: SDoc -> EqM a -> EqM a
-pushCtx d m = EqM $ \(# ctx, lv, env, ee #) -> unEqM m (# d : ctx, lv, env, ee #)
+pushCtx d m = EqM $ \(# ctx, lv, env, ee, lets #) -> unEqM m (# d : ctx, lv, env, ee, lets #)
 
 localRnEnv :: (RnEnv2 -> RnEnv2) -> EqM a -> EqM a
-localRnEnv f m = EqM $ \(# ctx, lv, env, ee #) -> unEqM m (# ctx, lv, f env, ee #)
+localRnEnv f m = EqM $ \(# ctx, lv, env, ee, lets #) -> unEqM m (# ctx, lv, f env, ee, lets #)
 
 withEqualVar :: Var -> Var -> EqM a -> EqM a
 withEqualVar v1 v2 = localRnEnv (\env' -> rnBndr2 env' v1 v2)
@@ -480,7 +480,7 @@ withEqualVars :: [Var] -> [Var] -> EqM a -> EqM a
 withEqualVars vs1 vs2 = localRnEnv (\env' -> rnBndrs2 env' vs1 vs2)
 
 localEqEnv :: (EqEnv -> EqEnv) -> EqM a -> EqM a
-localEqEnv f m = EqM $ \(# ctx, lv, env, ee #) -> unEqM m (# ctx, lv, env, f ee #)
+localEqEnv f m = EqM $ \(# ctx, lv, env, ee, lets #) -> unEqM m (# ctx, lv, env, f ee, lets #)
 
 instance Applicative EqM where
   pure x = EqM (\_ -> pure x)
@@ -493,12 +493,12 @@ instance Monad EqM where
     unEqM (k x) r
 
 tracePut :: String -> String -> EqM ()
-tracePut tag msg = EqM $ \ (# _, lv, _, _ #) -> tracePut' lv tag msg
+tracePut tag msg = EqM $ \ (# _, lv, _, _, _ #) -> tracePut' lv tag msg
 
 traceBlock :: String -> String -> EqM () -> EqM ()
 traceBlock name msg action = do
     tracePut name msg
-    localEqM (\(# ctx, lv, env, ee #) -> (# ctx, lv + 1, env, ee #)) action
+    localEqM (\(# ctx, lv, env, ee, lets #) -> (# ctx, lv + 1, env, ee, lets #)) action
     tracePut name $ msg ++ " OK"
 
 showVars :: [(Var, a)] -> String
