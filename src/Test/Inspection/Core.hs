@@ -1,6 +1,7 @@
 -- | This module implements some analyses of Core expressions necessary for
 -- "Test.Inspection". Normally, users of this package can ignore this module.
 {-# LANGUAGE CPP, FlexibleContexts, PatternSynonyms, MultiWayIf, ViewPatterns #-}
+{-# LANGUAGE DeriveFunctor, UnboxedTuples #-}
 module Test.Inspection.Core
   ( slice
   , pprSlice
@@ -64,11 +65,12 @@ import GHC.Core.TyCo.Compare (eqTypeX)
 #endif
 
 import qualified Data.Set as S
-import Control.Monad (unless)
+import Control.Monad (unless, ap)
 import Control.Monad.State.Strict (execState,  modify', gets)
 import Data.List (nub, intercalate)
 import Data.Maybe (listToMaybe, fromJust)
 import Data.Either (isRight)
+import GHC.Exts (oneShot)
 
 import Test.Inspection (Equivalence (..))
 
@@ -78,11 +80,11 @@ import Test.Inspection (Equivalence (..))
 #ifdef DEBUG_TRACE
 import Debug.Trace
 
-tracePut :: Monad m => Int -> String -> String -> m ()
-tracePut lv name msg = traceM $ replicate lv ' ' ++ name ++ ": " ++ msg
+tracePut' :: Monad m => Int -> String -> String -> m ()
+tracePut' lv name msg = traceM $ replicate lv ' ' ++ name ++ ": " ++ msg
 #else
-tracePut :: Monad m => Int -> String -> String -> m ()
-tracePut _  _    _ = return ()
+tracePut' :: Monad m => Int -> String -> String -> m ()
+tracePut' _  _    _ = return ()
 #endif
 
 #if !MIN_VERSION_ghc(9,2,0)
@@ -214,6 +216,12 @@ bindEqEnv ls rs (EqEnv i env1 env2)= EqEnv (i + 1)
     ([ (x, (i, e1)) | (x, e1) <- ls ] ++ env1)
     ([ (y, (i, e2)) | (y, e2) <- rs ] ++ env2)
 
+-- |report inequality
+inequality ::  SDoc -> EqM a
+inequality err = EqM $ \(# ctx, _, _, _ #) -> Left $ case ctx of
+    [] -> err
+    _  -> err $$ hang (text "in") 2 (vcat ctx)
+
 -- | This is a heuristic, which only works if both slices
 -- have auxiliary variables in the right order.
 -- (This is mostly to work-around the buggy CSE in GHC-8.0)
@@ -246,7 +254,7 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
 
     goStart :: Var -> CoreExpr -> Var -> CoreExpr -> Either SDoc ()
     goStart x e1 y e2 = do
-        tracePut 0 "TOP" (varToString x ++ " =?= " ++ varToString y)
+        tracePut' 0 "TOP" (varToString x ++ " =?= " ++ varToString y)
         if | Just x'  <- essentiallyVar e1
            , Just e1' <- lookup x' slice1
            -> goStart x' e1' y e2
@@ -262,7 +270,7 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
            -> do
               let env = rnBndr2 (mkRnEnv2 emptyInScopeSet) x y
                   ee  = initialEqEnv slice1 slice2
-              go [] 0 env ee e1 e2
+              unEqM (go e1 e2) (# [], 0, env, ee #)
 
     essentiallyVar :: CoreExpr -> Maybe Var
     essentiallyVar (App e a)  | it, isTyCoArg a = essentiallyVar e
@@ -276,13 +284,10 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
     essentiallyVar (Tick SourceNote{} e)        = essentiallyVar e
     essentiallyVar _                            = Nothing
 
-    -- report inequality
-    inequality :: [SDoc] -> SDoc -> Either SDoc a
-    inequality []  err = Left err
-    inequality ctx err = Left $ err $$ hang (text "in") 2 (vcat ctx)
-
-    go :: [SDoc] -> Int -> RnEnv2 -> EqEnv -> CoreExpr -> CoreExpr -> Either SDoc ()
-    go ctx lv env ee (essentiallyVar -> Just v1) (essentiallyVar -> Just v2) = do
+    go :: CoreExpr -> CoreExpr -> EqM ()
+    go (essentiallyVar -> Just v1) (essentiallyVar -> Just v2) = do
+        env <- askRnEnv
+        ee  <- askEqEnv
         -- NOTE: The ordering of this checks is important.
         --
         -- See example https://github.com/nomeata/inspection-testing/pull/89#issuecomment-2967774956
@@ -301,7 +306,7 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
            | inRnEnvL env v1
            , inRnEnvR env v2
            , rnOccL env v1 == rnOccR env v2 -> do
-            tracePut lv "VAR" (varToString v1 ++ " =?= " ++ varToString v2 ++ " IN ENV")
+            tracePut "VAR" (varToString v1 ++ " =?= " ++ varToString v2 ++ " IN ENV")
             return ()
 
            | Just (i, j, e1, e2) <- lookupEqEnv v1 v2 ee ->
@@ -309,119 +314,122 @@ eqSlice' eqv slice1@((head1, def1) : _) slice2@((head2, def2) : _) = do
              -- if they are not we fail immediately and not fall-back further.
              if i == j
              then do
-               tracePut lv "VAR" (varToString v1 ++ " =?= " ++ varToString v2 ++ " BOUND " ++ show i)
-               let ctx' = text "comparing definitions of" <+> ppr v1 <+> text "=?=" <+> ppr v2 : ctx
-               let env' = rnBndr2 env v1 v2
-               go ctx' lv env' ee e1 e2
+               tracePut "VAR" (varToString v1 ++ " =?= " ++ varToString v2 ++ " BOUND " ++ show i)
+               pushCtx (text "comparing definitions of" <+> ppr v1 <+> text "=?=" <+> ppr v2) $
+                  localRnEnv (\env' -> rnBndr2 env' v1 v2) $
+                  go e1 e2
              else do
-               tracePut lv "VAR" (varToString v1 ++ " =?= " ++ varToString v2 ++ " BOUND IN DIFFERENT LETS " ++ show i ++ " /= " ++ show j)
-               inequality ctx $ hsep [ text "variables", ppr v1, text "and", ppr v2, text "are bound in different lets" ]
+               tracePut "VAR" (varToString v1 ++ " =?= " ++ varToString v2 ++ " BOUND IN DIFFERENT LETS " ++ show i ++ " /= " ++ show j)
+               inequality $ hsep [ text "variables", ppr v1, text "and", ppr v2, text "are bound in different lets" ]
 
            | v1 == v2 -> do
-            tracePut lv "VAR" (varToString v1 ++ " =?= " ++ varToString v2 ++ " SAME")
+            tracePut "VAR" (varToString v1 ++ " =?= " ++ varToString v2 ++ " SAME")
             return ()
 
            | otherwise -> do
-            tracePut lv "VAR" (varToString v1 ++ " =?= " ++ varToString v2 ++ " NOT EQUAL")
-            inequality ctx $ hsep [ text "inequal variables", ppr v1, text "and", ppr v2 ]
+            tracePut "VAR" (varToString v1 ++ " =?= " ++ varToString v2 ++ " NOT EQUAL")
+            inequality $ hsep [ text "inequal variables", ppr v1, text "and", ppr v2 ]
 
-    go ctx lv _   _  (Lit lit1)    (Lit lit2)        = do
-        tracePut lv "LIT" "???" -- no Show for Literal :(
-        unless (lit1 == lit2) $ inequality ctx $ sep [ text "inequal literals", ppr lit1, text "and", ppr lit2 ]
+    go (Lit lit1)    (Lit lit2)        = do
+        tracePut "LIT" "???" -- no Show for Literal :(
+        unless (lit1 == lit2) $ inequality $ sep [ text "inequal literals", ppr lit1, text "and", ppr lit2 ]
 
-    go ctx _  env _  (Type t1)     (Type t2)         =
-        goTypes ctx env t1 t2
+    go (Type t1)     (Type t2)         =
+        goTypes t1 t2
 
-    go ctx _  env _  (Coercion co1) (Coercion co2)   =
-        goCoercions ctx env co1 co2
+    go (Coercion co1) (Coercion co2)   =
+        goCoercions co1 co2
 
-    go ctx lv env ee (Cast e1 _) e2 | it             = go ctx lv env ee e1 e2
-    go ctx lv env ee e1 (Cast e2 _) | it             = go ctx lv env ee e1 e2
+    go (Cast e1 _) e2 | it             = go e1 e2
+    go e1 (Cast e2 _) | it             = go e1 e2
 #if MIN_VERSION_ghc(9,0,0)
-    go ctx lv env ee (Case s b _ alts) e2 | it, Just e1 <- isUnsafeEqualityCase s b alts = go ctx lv env ee e1 e2
-    go ctx lv env ee e1 (Case s b _ alts) | it, Just e2 <- isUnsafeEqualityCase s b alts = go ctx lv env ee e1 e2
+    go (Case s b _ alts) e2 | it, Just e1 <- isUnsafeEqualityCase s b alts = go e1 e2
+    go e1 (Case s b _ alts) | it, Just e2 <- isUnsafeEqualityCase s b alts = go e1 e2
 #endif
-    go ctx lv env ee (Cast e1 co1) (Cast e2 co2)     = traceBlock lv "CAST" "" $ \lv -> do
-                                                   goCoercions ctx env co1 co2
-                                                   go ctx lv env ee e1 e2
+    go (Cast e1 co1) (Cast e2 co2)     = traceBlock "CAST" "" $ do
+                                                   goCoercions co1 co2
+                                                   go e1 e2
 
-    go ctx lv env ee (App e1 a) e2 | it, isTyCoArg a = go ctx lv env ee e1 e2
-    go ctx lv env ee e1 (App e2 a) | it, isTyCoArg a = go ctx lv env ee e1 e2
-    go ctx lv env ee (App f1 a1)   (App f2 a2)       = traceBlock lv "APP" "" $ \lv -> do
-                                                   go ctx lv env ee f1 f2
-                                                   go ctx lv env ee a1 a2
-    go ctx lv env ee (Tick HpcTick{} e1) e2 | it     = go ctx lv env ee e1 e2
-    go ctx lv env ee e1 (Tick HpcTick{} e2) | it     = go ctx lv env ee e1 e2
-    go ctx lv env ee (Tick SourceNote{} e1) e2       = go ctx lv env ee e1 e2
-    go ctx lv env ee e1 (Tick SourceNote{} e2)       = go ctx lv env ee e1 e2
-    go ctx lv env ee (Tick n1 e1)  (Tick n2 e2)      = traceBlock lv "TICK" "" $ \lv -> do
-                                                   unless (go_tick env n1 n2) $ inequality ctx $ text "inequal ticks"
-                                                   go ctx lv env ee e1 e2
+    go (App e1 a) e2 | it, isTyCoArg a = go e1 e2
+    go e1 (App e2 a) | it, isTyCoArg a = go e1 e2
+    go (App f1 a1)   (App f2 a2)       = traceBlock "APP" "" $ do
+                                                   go f1 f2
+                                                   go a1 a2
+    go (Tick HpcTick{} e1) e2 | it     = go e1 e2
+    go e1 (Tick HpcTick{} e2) | it     = go e1 e2
+    go (Tick SourceNote{} e1) e2       = go e1 e2
+    go e1 (Tick SourceNote{} e2)       = go e1 e2
+    go (Tick n1 e1)  (Tick n2 e2)      = traceBlock "TICK" "" $ do
+                                                   env <- askRnEnv
+                                                   unless (go_tick env n1 n2) $ inequality $ text "inequal ticks"
+                                                   go e1 e2
 
-    go ctx lv env ee (Lam b e1) e2 | it, isTyCoVar b = go ctx lv env ee e1 e2
-    go ctx lv env ee e1 (Lam b e2) | it, isTyCoVar b = go ctx lv env ee e1 e2
-    go ctx lv env ee (Lam b1 e1)  (Lam b2 e2)        = traceBlock lv "LAM" (varToString b1 ++ " ~ " ++ varToString b2) $ \lv -> do
-           unless it $ goTypes ctx env (varType b1) (varType b2)
-           go ctx lv (rnBndr2 env b1 b2) ee e1 e2
+    go (Lam b e1) e2 | it, isTyCoVar b = go e1 e2
+    go e1 (Lam b e2) | it, isTyCoVar b = go e1 e2
+    go (Lam b1 e1)  (Lam b2 e2)        = traceBlock "LAM" (varToString b1 ++ " ~ " ++ varToString b2) $ do
+           unless it $ goTypes (varType b1) (varType b2)
+           localRnEnv (\env -> rnBndr2 env b1 b2) $ go e1 e2
 
-    go ctx lv env ee e1@(Let _ _) e2@(Let _ _)
+    go e1@(Let _ _) e2@(Let _ _)
       | ul
       , (ps1, e1') <- peelLets e1
       , (ps2, e2') <- peelLets e2
-      = traceBlock lv "LET" (showVars ps1 ++ " ~ " ++ showVars ps2) $ \lv -> do
-           let ctx' = text "let bindings:" <+> pprVars ps1 <+> pprVars ps2 : ctx
-           unless (equalLength ps1 ps2) $ inequality ctx $ text "different amount of bindings in let"
-           let ee' = bindEqEnv ps1 ps2 ee
-           go ctx' lv env ee' e1' e2'
+      = traceBlock "LET" (showVars ps1 ++ " ~ " ++ showVars ps2) $
+        pushCtx (text "let bindings:" <+> pprVars ps1 <+> pprVars ps2) $
+        localEqEnv (bindEqEnv ps1 ps2) $ do
+           unless (equalLength ps1 ps2) $ inequality $ text "different amount of bindings in let"
+           go e1' e2'
 
-    go ctx lv env ee (Let (NonRec v1 r1) e1) (Let (NonRec v2 r2) e2)
-      = do go ctx lv env ee r1 r2  -- No need to check binder types, since RHSs match
-           go ctx lv (rnBndr2 env v1 v2) ee e1 e2
+    go (Let (NonRec v1 r1) e1) (Let (NonRec v2 r2) e2)
+      = do go r1 r2  -- No need to check binder types, since RHSs match
+           localRnEnv (\env -> rnBndr2 env v1 v2) $ go e1 e2
 
-    go ctx lv env ee (Let (Rec ps1) e1) (Let (Rec ps2) e2)
-      = do
-           unless (equalLength ps1 ps2) $ inequality ctx $ text "different amount of bindings in recursive let"
-           sequence_ $ zipWith (go ctx lv env' ee) rs1 rs2
-           go ctx lv env' ee e1 e2
+    go (Let (Rec ps1) e1) (Let (Rec ps2) e2)
+      = localRnEnv (\env' -> rnBndrs2 env' bs1 bs2) $ do
+           unless (equalLength ps1 ps2) $ inequality $ text "different amount of bindings in recursive let"
+           sequence_ $ zipWith go rs1 rs2
+           go e1 e2
       where
         bs1, bs2 :: [CoreBndr]
         rs1, rs2 :: [CoreExpr]
 
         (bs1,rs1) = unzip ps1
         (bs2,rs2) = unzip ps2
-        env' = rnBndrs2 env bs1 bs2
 
-    go ctx lv env ee (Case e1 b1 t1 a1) (Case e2 b2 t2 a2)
+    go (Case e1 b1 t1 a1) (Case e2 b2 t2 a2)
       | null a1   -- See Note [Empty case alternatives] in TrieMap
       , null a2
       = do
-           go ctx lv env ee e1 e2
-           unless it $ goTypes ctx env t1 t2
+           go e1 e2
+           unless it $ goTypes t1 t2
 
       | otherwise
-      = traceBlock lv "CASE" "..." $ \lv -> do
-           unless (equalLength a1 a2) $ inequality ctx $ text "different amount of alternatives in case"
-           go ctx lv env ee e1 e2
-           sequence_ $ zipWith (go_alt ctx lv (rnBndr2 env b1 b2) ee) a1 a2
+      = traceBlock "CASE" "..." $ do
+           unless (equalLength a1 a2) $ inequality $ text "different amount of alternatives in case"
+           go e1 e2
+           localRnEnv (\env -> rnBndr2 env b1 b2) $ do
+             sequence_ $ zipWith go_alt a1 a2
 
-    go ctx lv _ _  e1 e2 = do
-        tracePut lv "FAIL" (conToString e1 ++ " =/= " ++ conToString e2)
-        inequality ctx $ sep [ text "inequal terms:", ppr e1, text "and", ppr e2]
+    go e1 e2 = do
+        tracePut "FAIL" (conToString e1 ++ " =/= " ++ conToString e2)
+        inequality $ sep [ text "inequal terms:", ppr e1, text "and", ppr e2]
 
-    goCoercions ctx env t1 t2
-        | eqCoercionX env t1 t2 = return ()
-        | otherwise             = inequality ctx $ sep [ text "inequal coercions:", ppr t1, text "and", ppr t2 ]
+    goCoercions :: Coercion -> Coercion -> EqM ()
+    goCoercions t1 t2 = do
+        env <- askRnEnv
+        unless (eqCoercionX env t1 t2) $ inequality $ sep [ text "inequal coercions:", ppr t1, text "and", ppr t2 ]
 
-    goTypes ctx env t1 t2
-        | eqTypeX env t1 t2 = return ()
-        | otherwise         = inequality ctx $ sep [ text "inequal types:", ppr t1, text "and", ppr t2 ]
+    goTypes :: Type -> Type -> EqM ()
+    goTypes t1 t2 = do
+        env <- askRnEnv
+        unless (eqTypeX env t1 t2) $ inequality $ sep [ text "inequal types:", ppr t1, text "and", ppr t2 ]
 
     -----------
-    go_alt :: [SDoc] -> Int -> RnEnv2 -> EqEnv -> CoreAlt -> CoreAlt -> Either SDoc ()
-    go_alt ctx lv env ee (Alt c1 bs1 e1) (Alt c2 bs2 e2)
-      = traceBlock lv "ALT" "..." $ \lv -> do
-           unless (c1 == c2) $ inequality ctx $ sep [ text "inequal constructors:", ppr c1, text "and", ppr c2 ]
-           go ctx lv (rnBndrs2 env bs1 bs2) ee e1 e2
+    go_alt :: CoreAlt -> CoreAlt -> EqM ()
+    go_alt (Alt c1 bs1 e1) (Alt c2 bs2 e2)
+      = traceBlock "ALT" "..." $ do
+           unless (c1 == c2) $ inequality $ sep [ text "inequal constructors:", ppr c1, text "and", ppr c2 ]
+           localRnEnv (\env -> rnBndrs2 env bs1 bs2) $ go e1 e2
 
     go_tick :: RnEnv2 -> CoreTickish -> CoreTickish -> Bool
     go_tick env Breakpoint{ breakpointId = lid, breakpointFVs = lids } Breakpoint{ breakpointId = rid, breakpointFVs = rids }
@@ -443,11 +451,51 @@ isUnsafeEqualityCase _ _ _ = Nothing
 type CoreTickish = Tickish Id
 #endif
 
-traceBlock :: Monad m => Int -> String -> String -> (Int -> m ()) -> m ()
-traceBlock lv name msg action = do
-    tracePut lv name msg
-    action (lv + 1)
-    tracePut lv name $ msg ++ " OK"
+
+-- | Monad for eqSlice
+newtype EqM a = EqM_ { unEqM :: (# [SDoc], Int, RnEnv2, EqEnv #) -> Either SDoc a }
+  deriving Functor
+
+pattern EqM :: ((# [SDoc], Int, RnEnv2, EqEnv #) -> Either SDoc a) -> EqM a
+pattern EqM m <- (unEqM -> m)
+  where EqM m = EqM_ (oneShot m)
+
+localEqM :: ((# [SDoc], Int, RnEnv2, EqEnv #) -> (# [SDoc], Int, RnEnv2, EqEnv #)) -> EqM a -> EqM a
+localEqM f m = EqM $ \r -> unEqM m (f r)
+
+askRnEnv :: EqM RnEnv2
+askRnEnv = EqM $ \(# _, _, env, _ #) -> pure env
+
+askEqEnv :: EqM EqEnv
+askEqEnv = EqM $ \(# _, _, _, ee #) -> pure ee
+
+pushCtx :: SDoc -> EqM a -> EqM a
+pushCtx d m = EqM $ \(# ctx, lv, env, ee #) -> unEqM m (# d : ctx, lv, env, ee #)
+
+localRnEnv :: (RnEnv2 -> RnEnv2) -> EqM a -> EqM a
+localRnEnv f m = EqM $ \(# ctx, lv, env, ee #) -> unEqM m (# ctx, lv, f env, ee #)
+
+localEqEnv :: (EqEnv -> EqEnv) -> EqM a -> EqM a
+localEqEnv f m = EqM $ \(# ctx, lv, env, ee #) -> unEqM m (# ctx, lv, env, f ee #)
+
+instance Applicative EqM where
+  pure x = EqM (\_ -> pure x)
+  (<*>) = ap
+
+instance Monad EqM where
+  return = pure
+  m >>= k = EqM $ \ r -> do
+    x <- unEqM m r
+    unEqM (k x) r
+
+tracePut :: String -> String -> EqM ()
+tracePut tag msg = EqM $ \ (# _, lv, _, _ #) -> tracePut' lv tag msg
+
+traceBlock :: String -> String -> EqM () -> EqM ()
+traceBlock name msg action = do
+    tracePut name msg
+    localEqM (\(# ctx, lv, env, ee #) -> (# ctx, lv + 1, env, ee #)) action
+    tracePut name $ msg ++ " OK"
 
 showVars :: [(Var, a)] -> String
 showVars xs = intercalate ", " [ varToString x | (x, _) <- xs ]
@@ -462,7 +510,7 @@ varToString v = occNameString (occName (tyVarName v)) ++ "_" ++ show (getUnique 
 conToString :: CoreExpr -> [Char]
 conToString Var {}      = "Var"
 conToString Lit {}      = "Lit"
-conToString App {}      = "App"
+gconToString App {}      = "App"
 conToString Lam {}      = "Lam"
 conToString Let {}      = "Let"
 conToString Case {}     = "Case"
